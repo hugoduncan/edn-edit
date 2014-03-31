@@ -1,5 +1,6 @@
-(ns com.palletops.edn-edit
-  "Rules for source transforms"
+(ns com.palletops.edn-edit.pr-str
+  "Output data to string, preserving source comments."
+  (:refer-clojure :exclude [pr-str])
   (:require
    [clojure.string :as string :refer [blank? trim]]
    [clojure.zip :as zip]
@@ -13,12 +14,11 @@
 (defn data-coll-type
   "Return a collection type for the state data."
   [{:keys [loc data] :as state}]
-  (let [d (::data data)]
-    (cond
-     (map? d) :map
-     (vector? d) :vector
-     (set? d) :set
-     :else :list)))
+  (cond
+   (map? data) :map
+   (vector? data) :vector
+   (set? data) :set
+   :else :list))
 
 (defn node-coll-type [{:keys [loc data] :as state}]
   ;; {:pre [(#{:list :net.cgrand.sjacket.parser/root} (:tag node))]}
@@ -83,9 +83,9 @@
              (zip/branch? loc)
              (coll-tags (:tag (zip/node loc))))
       (let [{:keys [loc data] :as state} (coll-mode state)]
-        (println "walk coll-mode" (:coll-mode state) (::data data))
+        (println "walk coll-mode" (:coll-mode state) data)
         (case (:coll-mode state)
-          :replace (apply-loc state replace-with-value (::data data))
+          :replace (apply-loc state replace-with-value data)
           :update-in-place
           (-> state
               (apply-loc zip/down)
@@ -115,14 +115,13 @@
   (loop [state (if (node-literal? (zip/node loc))
                  (apply-loc state zip/right)
                  state)
-         rdata (::data data)]
+         rdata data]
     (let [state (apply-loc state skip-whitespace)]
       (if (node-literal? (zip/node (:loc state)))
-        (add-new-values (assoc-in state [:data ::data] rdata))
+        (add-new-values (assoc state :data rdata))
         (if (first rdata)
           (let [{:keys [loc data] :as state} (walk
-                                              (assoc-in state [:data ::data]
-                                                        (first rdata))
+                                              (assoc state :data (first rdata))
                                               options)
                 r (zip/right loc)]
             (if r
@@ -142,26 +141,25 @@
 
 (defmethod walk-level :map
   [{:keys [loc data] :as state} options]
-  {:pre [loc (map? (::data data))]}
+  {:pre [loc (map? data)]}
   (loop [state state]
     (assert (:loc state))
     (let [key-state (apply-loc state skip-whitespace)
           val-state (if (:loc (apply-loc key-state zip/right))
                       (apply-loc key-state (comp skip-whitespace zip/right)))]
       (if (and key-state val-state)
-        (let [key-value (read-value key-state)
-              val-value (read-value val-state)]
+        (let [key-value (read-value (state-node key-state))
+              val-value (read-value (state-node val-state))]
           (if (contains? data key-value)
             (if (= val-value (get data key-value))
               (recur (-> val-state
                          (apply-loc zip/right)
-                         (apply-data update-in [::data] dissoc key-value)))
+                         (apply-data dissoc key-value)))
               (recur (-> val-state
-                         (apply-data assoc
-                                     ::data (get-in [data ::data] key-value))
+                         (apply-data get key-value)
                          (walk options)
                          (apply-loc zip/right)
-                         (apply-data update-in [::data] dissoc key-value))))
+                         (apply-data dissoc key-value))))
             (recur (-> state
                        remove-value
                        (apply-loc zip/right)
@@ -172,17 +170,17 @@
 
 (defmethod walk-level :set
   [{:keys [loc data] :as state} options]
-  {:pre [loc (set? (::data data))]}
+  {:pre [loc (set? data)]}
   (loop [state (if (node-literal? (zip/node loc))
                  (apply-loc state zip/right)
                  state)]
     (let [{:keys [loc data] :as state} (apply-loc state skip-whitespace)]
       (if (:tag (zip/node loc))
-        (let [value (read-value state)]
-          (if ((::data data) value)
+        (let [value (read-value (state-node state))]
+          (if (data value)
             (recur (-> state
                        (apply-loc zip/right)
-                       (apply-data update-in [::data] disj value)))
+                       (apply-data disj value)))
             (recur (-> state
                        remove-value))))
         (-> state
@@ -224,91 +222,24 @@
     state
     (apply-loc state replace-with-value data)))
 
-;;; # Edit level walker
-(def edit-level nil)
-(defmulti edit-level
-  "Walk all zip elements on the same level"
-  (fn [state options]
-    (data-coll-type state)))
-
-(defmethod edit-level :default
-  [state options]
-  (walk-level state options))
-
-(defmethod edit-level :map
-  [{:keys [loc data] :as state} options]
-  {:pre [loc (map? data)]}
-  (loop [state state]
-    (assert (:loc state))
-    (let [key-state (apply-loc state skip-whitespace)
-          val-state (if (:loc (apply-loc key-state zip/right))
-                      (apply-loc key-state (comp skip-whitespace zip/right)))]
-      (if (and key-state val-state)
-        (let [key-value (read-value key-state)
-              val-value (read-value val-state)
-              d (get-in data [::delete key-value])
-              s (get-in data [::set key-value])
-              delete? (and d (keyword? d))
-              walk? (and d (map? d))]
-          (cond
-           (or s walk?) (recur (-> val-state
-                                   (apply-data update-in [::delete]
-                                               get key-value)
-                                   (walk options)
-                                   (apply-loc zip/right)
-                                   (apply-data update-in [::set]
-                                               dissoc key-value)))
-           delete? (recur (-> state
-                              remove-value
-                              (apply-loc zip/right)
-                              remove-value))
-           :else (recur (-> val-state
-                            (apply-loc zip/right)))))
-        (-> state
-            (add-new-kvs (get-in state [:data ::set]))
-            (apply-loc zip/up))))))
-
-
 ;;; # Top level API function
-(defn transform-source
+(defn pr-str
   "Transform the source using options :rules and the data in the
-  data map."
-  ([code data options]
+  data map. The top level of data should be a list, with top level
+  forms for the source."
+  ([data src-str options]
      {:pre [(map? options)]}
      (let [options (merge
                     {:rules [transform]
                      :walk-level walk-level}
-                    options)
-           data {::data data}]
-       (if (blank? (trim code))
-         code
-         (-> (walk {:loc (zip/xml-zip (parser/parser code))
+                    options)]
+       (if (blank? (trim src-str))
+         src-str
+         (-> (walk {:loc (zip/xml-zip (parser/parser src-str))
                     :data data}
                    options)
              :loc
              zip/root
              sjacket/str-pt))))
-  ([code data]
-     (transform-source code data {})))
-
-(defn edit-source
-  "Transform the source using options :rules and the data in the
-  data map."
-  ([code set-values delete-values options]
-     {:pre [(map? options)]}
-     (let [options (merge
-                    {:rules [transform]
-                     :walk-level edit-level}
-                    options)
-           data {::set set-values
-                 ::delete delete-values}]
-       (if (blank? (trim code))
-         code
-         (-> (walk {:loc (zip/xml-zip (parser/parser code))
-                    :data data}
-                   options)
-             :loc
-             zip/root
-             sjacket/str-pt))))
-  ([code set-values delete-values]
-     (edit-source code set-values delete-values {})))
+  ([data src-str]
+     (pr-str data src-str {})))

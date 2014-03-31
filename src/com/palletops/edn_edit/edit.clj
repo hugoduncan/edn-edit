@@ -1,5 +1,5 @@
-(ns com.palletops.edn-edit
-  "Rules for source transforms"
+(ns com.palletops.edn-edit.edit
+  "Edit data with comments."
   (:require
    [clojure.string :as string :refer [blank? trim]]
    [clojure.zip :as zip]
@@ -8,53 +8,9 @@
    [net.cgrand.sjacket :as sjacket]
    [net.cgrand.sjacket.parser :as parser]))
 
+;;; The state data contains the edits to make.
+
 ;;; # Tree Transforms
-
-(defn data-coll-type
-  "Return a collection type for the state data."
-  [{:keys [loc data] :as state}]
-  (let [d (::data data)]
-    (cond
-     (map? d) :map
-     (vector? d) :vector
-     (set? d) :set
-     :else :list)))
-
-(defn node-coll-type [{:keys [loc data] :as state}]
-  ;; {:pre [(#{:list :net.cgrand.sjacket.parser/root} (:tag node))]}
-  (condp = (first (:content (zip/node loc)))
-    "{" :map
-    "[" :vector
-    "#{" :set
-    :list))
-
-(defn coll-mode [{:keys [loc data] :as state}]
-  (let [data-type (data-coll-type state)
-        node-type (node-coll-type state)]
-    (println "coll-mode" data-type node-type)
-    (assoc state
-      :coll-mode (cond
-                  (= data-type node-type) :update-in-place
-                  (every? #{:list :vector} [data-type node-type]) :update-type
-                  :else :replace))))
-
-(def open-delimiters
-  {:map "{"
-   :set "#{"
-   :vector "["
-   :list "("})
-
-(def close-delimiters
-  {:map "}"
-   :set "}"
-   :vector "]"
-   :list ")"})
-
-(defn replace-delimiters
-  [{:keys [loc data] :as state} delimiters]
-  (if (string? (zip/node loc))
-    (apply-loc state zip/edit (constantly (delimiters (data-coll-type state))))
-    state))
 
 ;;; ## Zip walker
 (declare walk)
@@ -65,40 +21,26 @@
   (fn [state options]
     (data-coll-type state)))
 
-(def coll-tags #{:list :set :map :vector :net.cgrand.sjacket.parser/root})
-
 (defn walk
   "Walk a zip using the data and location in state, and the
   transformation rules."
   [{:keys [loc data] :as state}
-   {:keys [rules root-only walk-level] :as options}]
+   {:keys [rules walk-level] :as options}]
   {:pre [loc rules walk-level]}
   (println)
   (println "walk data" data)
   (let [{:keys [loc data] :as state} (reduce #(%2 %) state rules)]
     (assert loc "rule must return a non-nil loc")
     (print-node state "walk after rules")
-    (if (and (or (not root-only) (node-root? (zip/node loc)))
-             (not (:finished state))
-             (zip/branch? loc)
-             (coll-tags (:tag (zip/node loc))))
-      (let [{:keys [loc data] :as state} (coll-mode state)]
-        (println "walk coll-mode" (:coll-mode state) (::data data))
-        (case (:coll-mode state)
-          :replace (apply-loc state replace-with-value (::data data))
-          :update-in-place
-          (-> state
-              (apply-loc zip/down)
-              (walk-level options))
-          :update-type
-          (-> state
-              (apply-loc zip/down)
-              (replace-delimiters open-delimiters)
-              (walk-level options)
-              (replace-delimiters close-delimiters))))
+    (if (and (not (:finished state))
+             (zip/branch? loc))
+      (-> state
+          (apply-loc zip/down)
+          (walk-level options))
       state)))
 
 ;;; ## Collection specific walkers
+
 (defmethod walk-level :net.cgrand.sjacket.parser/root
   [{:keys [loc data] :as state} options]
   {:pre [loc]}
@@ -268,32 +210,20 @@
             (add-new-kvs (get-in state [:data ::set]))
             (apply-loc zip/up))))))
 
+;;; # Matchers
+
+(defn has-value? [value]
+  (fn has-value? [node index]
+    (= value (read-value node))))
 
 ;;; # Top level API function
-(defn transform-source
-  "Transform the source using options :rules and the data in the
-  data map."
-  ([code data options]
-     {:pre [(map? options)]}
-     (let [options (merge
-                    {:rules [transform]
-                     :walk-level walk-level}
-                    options)
-           data {::data data}]
-       (if (blank? (trim code))
-         code
-         (-> (walk {:loc (zip/xml-zip (parser/parser code))
-                    :data data}
-                   options)
-             :loc
-             zip/root
-             sjacket/str-pt))))
-  ([code data]
-     (transform-source code data {})))
-
 (defn edit-source
-  "Transform the source using options :rules and the data in the
-  data map."
+  "Transform the source using options :rules and the edit specs in the
+  data map.
+
+  An edit spec can be a map, in which case the key is some function that
+  can be used to match the data, and the value is a function to return the
+  new data."
   ([code set-values delete-values options]
      {:pre [(map? options)]}
      (let [options (merge
